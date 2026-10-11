@@ -1,108 +1,57 @@
-"""Tests for opt in read only mode."""
-
-import asyncio
-import subprocess
-import sys
+"""Tests for the fork's always-on, allowlist-based read only mode."""
 
 import pytest
 
 from monarch_mcp_server import read_only
 
 
-class TestIsReadOnly:
-    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on", " y "])
-    def test_truthy_values_enable_it(self, monkeypatch, value):
-        monkeypatch.setenv(read_only.ENV_VAR, value)
+def test_read_only_ignores_environment(monkeypatch):
+    for value in ("", "0", "false", "off"):
+        monkeypatch.setenv("MONARCH_MCP_READ_ONLY", value)
         assert read_only.is_read_only() is True
 
-    @pytest.mark.parametrize("value", ["", "0", "false", "no", "off", "maybe"])
-    def test_everything_else_leaves_it_off(self, monkeypatch, value):
-        monkeypatch.setenv(read_only.ENV_VAR, value)
-        assert read_only.is_read_only() is False
 
-    def test_unset_leaves_it_off(self, monkeypatch):
-        """Off by default, so existing setups are unaffected."""
-        monkeypatch.delenv(read_only.ENV_VAR, raising=False)
-        assert read_only.is_read_only() is False
+def _fake_mcp(registered):
+    class FakeMCP:
+        def tool(self, *args, **kwargs):
+            def decorator(fn):
+                registered.append(args[0] if args else kwargs.get("name") or fn.__name__)
+                return fn
 
+            return decorator
 
-class TestRegistration:
-    """Registration is skipped, not just guarded at call time.
-
-    A tool that is never registered cannot be invoked at all, which is
-    stronger than a client side approval prompt: the threat in the README's
-    approval section is a model influenced by a memo or merchant name it read
-    back, and that model cannot call what it cannot see.
-    """
-
-    def test_mutating_tools_are_not_registered(self, monkeypatch):
-        registered = []
-
-        class FakeMCP:
-            def tool(self, *args, **kwargs):
-                def decorator(fn):
-                    registered.append(fn.__name__)
-                    return fn
-
-                return decorator
-
-        monkeypatch.setenv(read_only.ENV_VAR, "1")
-        fake = FakeMCP()
-        read_only.install(fake)
-
-        def delete_transaction():
-            pass
-
-        def get_accounts():
-            pass
-
-        assert fake.tool()(delete_transaction) is delete_transaction
-        fake.tool()(get_accounts)
-
-        assert "delete_transaction" not in registered
-        assert "get_accounts" in registered
-
-    def test_nothing_is_skipped_when_disabled(self, monkeypatch):
-        registered = []
-
-        class FakeMCP:
-            def tool(self, *args, **kwargs):
-                def decorator(fn):
-                    registered.append(fn.__name__)
-                    return fn
-
-                return decorator
-
-        monkeypatch.delenv(read_only.ENV_VAR, raising=False)
-        fake = FakeMCP()
-        read_only.install(fake)
-
-        def delete_transaction():
-            pass
-
-        fake.tool()(delete_transaction)
-        assert registered == ["delete_transaction"]
+    return FakeMCP()
 
 
-class TestMutatingToolList:
-    async def test_every_named_tool_actually_exists(self):
-        """A typo here would silently leave a mutating tool exposed."""
-        from monarch_mcp_server.app import mcp
+def test_unknown_tools_are_not_registered():
+    registered = []
+    mcp = _fake_mcp(registered)
+    read_only.install(mcp)
 
-        registered = {t.name for t in await mcp.list_tools()}
-        # Only meaningful when read only is off, which is the default in tests.
-        if not read_only.is_read_only():
-            unknown = read_only.MUTATING_TOOLS - registered
-            assert not unknown, f"MUTATING_TOOLS names no such tools: {sorted(unknown)}"
+    @mcp.tool()
+    def get_accounts():
+        pass
 
-    async def test_it_matches_the_readme_approval_list(self):
-        """The two lists answer the same question and must not diverge."""
-        from pathlib import Path
+    @mcp.tool()
+    def delete_transaction():
+        pass
 
-        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
-        section = readme[readme.index("### Recommended: require approval") :]
-        missing = {n for n in read_only.MUTATING_TOOLS if f"`{n}`" not in section}
-        assert not missing, f"in MUTATING_TOOLS but not the README list: {sorted(missing)}"
+    @mcp.tool()
+    def some_new_upstream_tool():
+        pass
+
+    @mcp.tool("delete_everything")
+    def get_accounts_alias():
+        pass
+
+    assert registered == ["get_accounts"]
+
+
+async def test_registered_set_is_exactly_the_allowlist():
+    from monarch_mcp_server.app import mcp
+
+    registered = {t.name for t in await mcp.list_tools()}
+    assert registered == set(read_only.ALLOWED_TOOLS)
 
 
 class TestGateCannotSilentlyMissANewWriteTool:
@@ -197,107 +146,19 @@ class TestGateCannotSilentlyMissANewWriteTool:
                     mutating.add(name)
         return mutating, ro
 
-    async def test_every_writing_tool_is_gated(self):
+    async def test_no_allowlisted_tool_writes(self):
+        mutating, ro = self._mutating_from_source()
+        leaked = sorted(mutating & ro.ALLOWED_TOOLS)
+        assert not leaked, f"allowlisted tools that write: {leaked}"
+
+    async def test_no_registered_tool_writes(self):
         from monarch_mcp_server.app import mcp
 
-        mutating, ro = self._mutating_from_source()
+        mutating, _ = self._mutating_from_source()
         registered = {t.name for t in await mcp.list_tools()}
-        ungated = sorted((mutating & registered) - ro.MUTATING_TOOLS)
-        assert not ungated, (
-            "these tools write but are not in MUTATING_TOOLS, so read only "
-            f"mode would still expose them: {ungated}"
-        )
+        assert not (mutating & registered)
 
     async def test_the_detector_actually_detects_something(self):
         """Guard against the check above silently matching nothing."""
         mutating, _ = self._mutating_from_source()
-        assert len(mutating) >= 25, (
-            f"detector found only {len(mutating)} writing tools, so it is "
-            "probably broken rather than the code being clean"
-        )
-
-
-class TestPositionalToolName:
-    def test_a_positionally_named_mutating_tool_is_still_gated(self, monkeypatch):
-        """FastMCP.tool() takes name as its first positional parameter.
-
-        Comparing only fn.__name__ would let @mcp.tool("delete_transaction")
-        register under a gated name while slipping past the gate.
-        """
-        registered = []
-
-        class FakeMCP:
-            def tool(self, *args, **kwargs):
-                def decorator(fn):
-                    registered.append(args[0] if args else fn.__name__)
-                    return fn
-
-                return decorator
-
-        monkeypatch.setenv(read_only.ENV_VAR, "1")
-        fake = FakeMCP()
-        read_only.install(fake)
-
-        def some_helper():
-            pass
-
-        fake.tool("delete_transaction")(some_helper)
-        assert registered == []
-
-
-class TestDockerDefault:
-    """The container serves HTTP with no authentication, so it must default to
-    read only: otherwise anything reaching the port could call monarch_logout
-    or monarch_login_with_token and replace the stored session (issue #154)."""
-
-    @staticmethod
-    def _dockerfile_env():
-        from pathlib import Path
-
-        dockerfile = Path(__file__).resolve().parent.parent / "Dockerfile"
-        env = {}
-        in_env = False
-        for raw in dockerfile.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if line.startswith("ENV "):
-                in_env, line = True, line[4:]
-            if not in_env:
-                continue
-            continued = line.endswith("\\")
-            for pair in line.rstrip("\\").split():
-                key, _, value = pair.partition("=")
-                env[key] = value.strip('"')
-            in_env = continued
-        return env
-
-    def test_dockerfile_turns_read_only_on(self):
-        env = self._dockerfile_env()
-        assert env.get(read_only.ENV_VAR) == "1"
-
-    def test_session_tools_are_not_exposed_under_the_docker_env(self, tmp_path):
-        """Registration, not just the ENV line: the server started with the
-        image's setting must not list the tools that change the session."""
-        import os
-
-        env = {**os.environ, read_only.ENV_VAR: self._dockerfile_env()[read_only.ENV_VAR]}
-        env["HOME"] = str(tmp_path)
-        # conftest's keyring isolation only covers this process, and importing
-        # the app in the subprocess constructs SecureMonarchSession at module
-        # scope, which probes the keyring. With HOME pointed at an empty temp
-        # dir, macOS finds no login keychain there and prompts the developer to
-        # create or reset one, which also hangs an unattended run. Pin a null
-        # backend so the probe never reaches a real keychain.
-        env["PYTHON_KEYRING_BACKEND"] = "keyring.backends.null.Keyring"
-        script = (
-            "import asyncio\n"
-            "from monarch_mcp_server.app import mcp\n"
-            "names = {t.name for t in asyncio.run(mcp.list_tools())}\n"
-            "print(','.join(sorted(names)))\n"
-        )
-        result = subprocess.run(
-            [sys.executable, "-c", script], env=env, capture_output=True, text=True, check=True
-        )
-        names = set(result.stdout.strip().split(","))
-        assert names, "no tools were listed"
-        assert not names & {"monarch_login", "monarch_login_with_token", "monarch_logout"}
-        assert not names & read_only.MUTATING_TOOLS
+        assert len(mutating) >= 25

@@ -526,19 +526,20 @@ class SecureMonarchSession:
             session_data["cookies"] = dict(cookies)
         blob = json.dumps(session_data)
 
-        if self._use_keyring:
-            try:
-                self._keyring_save(blob)
-                logger.info(
-                    "✅ Session saved securely to keyring (auth_mode=%s)",
-                    auth_mode,
-                )
-                self._cleanup_old_session_files()
-                return
-            except Exception as e:
-                logger.warning(f"⚠️  Keyring save failed, falling back to file: {e}")
-
-        self._save_token_file(blob)
+        # Fork hardening: never fall back to a plaintext file. If the OS
+        # keyring cannot hold the session, fail loudly instead.
+        if not self._use_keyring:
+            raise RuntimeError(
+                "System keyring unavailable; refusing to store the Monarch "
+                "session in a plaintext file."
+            )
+        self._keyring_save(blob)
+        logger.info(
+            "✅ Session saved securely to keyring (auth_mode=%s)",
+            auth_mode,
+        )
+        # Remove any plaintext copy an earlier install may have left behind.
+        self._delete_token_file()
         self._cleanup_old_session_files()
 
     def save_token(self, token: str, *, device_uuid: Optional[str] = None) -> None:
@@ -574,10 +575,13 @@ class SecureMonarchSession:
         # must not end the search: if the keyring entry is corrupt, the file
         # fallback may still hold a perfectly good session, and giving up at
         # the first bad read would strand a user who actually is logged in.
-        for load_raw, source in (
-            (self._keyring_load_guarded, "keyring"),
-            (self._load_token_file, "file fallback"),
-        ):
+        if _TOKEN_FILE.exists():
+            logger.warning(
+                "⚠️  Plaintext session file %s exists and is ignored by this "
+                "fork. Delete it.",
+                _TOKEN_FILE,
+            )
+        for load_raw, source in ((self._keyring_load_guarded, "keyring"),):
             raw_session = load_raw()
             if not raw_session:
                 continue

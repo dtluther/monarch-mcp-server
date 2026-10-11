@@ -548,24 +548,6 @@ class TestFailedSaveIsNonDestructive:
         # The session the user actually had is still there and still correct.
         assert session.load_session()["cookies"] == good
 
-    def test_corrupt_keyring_entry_falls_through_to_file_fallback(
-        self, storage_keyring, monkeypatch, tmp_path
-    ):
-        """A bad keyring read must not strand a user who has a good file."""
-        session, fake = storage_keyring
-        session._save_token_file(
-            json.dumps({"token": "file-token", "auth_mode": "token"})
-        )
-        fake.set_password(
-            ss_module.KEYRING_SERVICE,
-            ss_module.KEYRING_USERNAME,
-            '{"auth_mode": "cookie", "token": "eyJ0eX',
-        )
-
-        loaded = session.load_session()
-        assert loaded is not None, "a corrupt keyring entry hid a good session"
-        assert loaded["token"] == "file-token"
-
     def test_legacy_ungenerationed_chunks_still_load(self, storage_keyring):
         """Sessions written before generations existed must survive upgrade."""
         session, fake = storage_keyring
@@ -637,103 +619,6 @@ def file_session(monkeypatch, tmp_path):
     return session, tmp_path / "store" / "token"
 
 
-class TestFileFallbackWrites:
-    """The file fallback holds a full access credential; treat it as one."""
-
-    def test_non_ascii_round_trips_regardless_of_locale(self, tmp_path, monkeypatch):
-        """The fallback is written UTF-8, so it must be read UTF-8.
-
-        read_text() with no encoding uses the locale's preferred encoding,
-        which on a non-UTF-8 Windows console is cp1252. A session blob holding
-        any non-ASCII character then either raises UnicodeDecodeError or
-        decodes to a different string than was stored, so the credential comes
-        back silently corrupt rather than missing.
-        """
-        token_file = tmp_path / "token.json"
-        monkeypatch.setattr(ss_module, "_TOKEN_FILE", token_file)
-
-        blob = json.dumps(
-            {"token": "abc", "name": "Zoë – café"}, ensure_ascii=False
-        )
-        assert any(ord(c) > 127 for c in blob)
-        ss_module._write_secret_file(token_file, blob)
-
-        assert token_file.read_bytes().decode("utf-8") == blob
-        assert ss_module.SecureMonarchSession()._load_token_file() == blob
-
-    @pytest.mark.skipif(
-        sys.platform == "win32",
-        reason=(
-            "POSIX mode bits are not how Windows protects this file. "
-            "os.stat() there reports a synthesised mode that ignores the ACL, "
-            "so the assertion below cannot express the property. The Windows "
-            "equivalent -- DPAPI encryption, which makes the bytes unreadable "
-            "to another local user regardless of ACL -- is covered by the "
-            "DPAPI tests."
-        ),
-    )
-    def test_file_is_never_world_readable(self, file_session):
-        """0600 must be set at creation, not after the bytes are on disk.
-
-        write_text creates the file under the process umask (typically 0644)
-        and only then chmods, leaving a window where any local user can read
-        the token.
-        """
-        import os
-        import stat as stat_module
-
-        session, token_file = file_session
-        session.save_session_blob(token="tok", auth_mode="token")
-
-        mode = stat_module.S_IMODE(os.stat(token_file).st_mode)
-        assert mode == 0o600, oct(mode)
-        dir_mode = stat_module.S_IMODE(os.stat(token_file.parent).st_mode)
-        assert dir_mode == 0o700, oct(dir_mode)
-
-    def test_write_is_atomic_via_replace(self, file_session, monkeypatch):
-        """A reader must never observe a partially written blob."""
-        import os
-
-        session, token_file = file_session
-        session.save_session_blob(token="original", auth_mode="token")
-
-        seen = {}
-        real_replace = os.replace
-
-        def spy_replace(src, dst):
-            # Before the rename lands, the live file still holds the old blob.
-            seen["during"] = ss_module._TOKEN_FILE.read_text(encoding="utf-8")
-            return real_replace(src, dst)
-
-        monkeypatch.setattr(os, "replace", spy_replace)
-        session.save_session_blob(token="replacement", auth_mode="token")
-
-        # On Windows the blob is DPAPI-encrypted at rest, so the old token is
-        # never present as plaintext. Decrypt before asserting, or the test
-        # checks the storage format rather than the atomicity it is named for.
-        during = seen["during"]
-        if during.startswith(ss_module._DPAPI_PREFIX):
-            during = ss_module._dpapi_decrypt(during)
-        assert "original" in during
-        assert session.load_session()["token"] == "replacement"
-
-    def test_failed_write_leaves_no_temp_file_behind(self, file_session, monkeypatch):
-        import os
-
-        session, token_file = file_session
-        session.save_session_blob(token="good", auth_mode="token")
-
-        def boom(src, dst):
-            raise OSError("disk full")
-
-        monkeypatch.setattr(os, "replace", boom)
-        with pytest.raises(OSError):
-            session.save_session_blob(token="doomed", auth_mode="token")
-
-        assert session.load_session()["token"] == "good"
-        assert list(token_file.parent.iterdir()) == [token_file]
-
-
 class TestCorruptedSessionHandling:
     """A truncated JSON blob must not be reinterpreted as a bare token."""
 
@@ -755,17 +640,6 @@ class TestCorruptedSessionHandling:
         token_file.write_text('[{"token": "abc"')
 
         assert session.load_session() is None
-
-    def test_genuine_legacy_bare_token_still_loads(self, file_session):
-        """Very old installs stored the raw token string; keep reading those."""
-        session, token_file = file_session
-        token_file.parent.mkdir(parents=True, exist_ok=True)
-        token_file.write_text("legacy-bare-token-value")
-
-        assert session.load_session() == {
-            "token": "legacy-bare-token-value",
-            "auth_mode": "token",
-        }
 
     def test_spliced_chunk_debris_is_not_accepted_as_a_token(self, file_session):
         """Debris that does not start with a brace must still be rejected.
@@ -835,3 +709,30 @@ class TestGetAuthenticatedClient:
     def test_no_session_returns_none(self, storage_keyring):
         session, _ = storage_keyring
         assert session.get_authenticated_client() is None
+
+
+class TestNoPlaintextFallback:
+    """Fork hardening: the session must never be written to a plaintext file."""
+
+    def test_save_refuses_without_keyring(self, tmp_path, monkeypatch):
+        import monarch_mcp_server.secure_session as ss
+
+        monkeypatch.setattr(ss, "_TOKEN_DIR", tmp_path / "store")
+        monkeypatch.setattr(ss, "_TOKEN_FILE", tmp_path / "store" / "token")
+        session = ss.SecureMonarchSession.__new__(ss.SecureMonarchSession)
+        session._use_keyring = False
+        with pytest.raises(RuntimeError):
+            session.save_token("abc")
+        assert not (tmp_path / "store" / "token").exists()
+
+    def test_existing_plaintext_file_is_ignored(self, tmp_path, monkeypatch):
+        import monarch_mcp_server.secure_session as ss
+
+        store = tmp_path / "store"
+        store.mkdir()
+        (store / "token").write_text('{"token": "abc", "auth_mode": "token"}')
+        monkeypatch.setattr(ss, "_TOKEN_DIR", store)
+        monkeypatch.setattr(ss, "_TOKEN_FILE", store / "token")
+        session = ss.SecureMonarchSession.__new__(ss.SecureMonarchSession)
+        session._use_keyring = False
+        assert session.load_session() is None
