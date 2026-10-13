@@ -1,14 +1,13 @@
-"""Tests for the fork's always-on, allowlist-based read only mode."""
+"""Tests for the fork's tool registration allowlist."""
 
 import pytest
 
 from monarch_mcp_server import read_only
 
-
-def test_read_only_ignores_environment(monkeypatch):
-    for value in ("", "0", "false", "off"):
-        monkeypatch.setenv("MONARCH_MCP_READ_ONLY", value)
-        assert read_only.is_read_only() is True
+# Tools the fork never registers, whatever the allowlist says.
+NEVER_REGISTERED = frozenset(
+    {"monarch_login", "monarch_login_with_token", "monarch_logout", "refresh_accounts"}
+)
 
 
 def _fake_mcp(registered):
@@ -23,7 +22,7 @@ def _fake_mcp(registered):
     return FakeMCP()
 
 
-def test_unknown_tools_are_not_registered():
+def test_only_allowlisted_tools_are_registered():
     registered = []
     mcp = _fake_mcp(registered)
     read_only.install(mcp)
@@ -37,6 +36,10 @@ def test_unknown_tools_are_not_registered():
         pass
 
     @mcp.tool()
+    def monarch_logout():
+        pass
+
+    @mcp.tool()
     def some_new_upstream_tool():
         pass
 
@@ -44,7 +47,15 @@ def test_unknown_tools_are_not_registered():
     def get_accounts_alias():
         pass
 
-    assert registered == ["get_accounts"]
+    assert registered == ["get_accounts", "delete_transaction"]
+
+
+def test_read_and_write_sets_do_not_overlap():
+    assert not (read_only.READ_TOOLS & read_only.WRITE_TOOLS)
+
+
+def test_session_and_refresh_tools_are_not_allowlisted():
+    assert not (read_only.ALLOWED_TOOLS & NEVER_REGISTERED)
 
 
 async def test_registered_set_is_exactly_the_allowlist():
@@ -52,12 +63,13 @@ async def test_registered_set_is_exactly_the_allowlist():
 
     registered = {t.name for t in await mcp.list_tools()}
     assert registered == set(read_only.ALLOWED_TOOLS)
+    assert not (registered & NEVER_REGISTERED)
 
 
 class TestGateCannotSilentlyMissANewWriteTool:
     """The direction that actually matters.
 
-    Asserting every name in MUTATING_TOOLS exists catches a typo. It cannot
+    Asserting every name in WRITE_TOOLS exists catches a typo. It cannot
     catch a newly added writing tool that nobody put in the set, which is the
     failure that exposes a write in a deployment whose whole premise is that it
     cannot write. This derives the mutating set from the code instead.
@@ -146,17 +158,20 @@ class TestGateCannotSilentlyMissANewWriteTool:
                     mutating.add(name)
         return mutating, ro
 
-    async def test_no_allowlisted_tool_writes(self):
+    async def test_no_read_tool_writes(self):
         mutating, ro = self._mutating_from_source()
-        leaked = sorted(mutating & ro.ALLOWED_TOOLS)
-        assert not leaked, f"allowlisted tools that write: {leaked}"
+        leaked = sorted(mutating & ro.READ_TOOLS)
+        assert not leaked, f"tools in READ_TOOLS that write: {leaked}"
 
-    async def test_no_registered_tool_writes(self):
+    async def test_every_registered_writing_tool_is_in_write_tools(self):
+        """A write must never be registered without being listed as one, so
+        the README approval list and WRITE_TOOLS cannot miss it."""
         from monarch_mcp_server.app import mcp
 
-        mutating, _ = self._mutating_from_source()
+        mutating, ro = self._mutating_from_source()
         registered = {t.name for t in await mcp.list_tools()}
-        assert not (mutating & registered)
+        unlisted = sorted((mutating & registered) - ro.WRITE_TOOLS)
+        assert not unlisted, f"registered tools that write but are not in WRITE_TOOLS: {unlisted}"
 
     async def test_the_detector_actually_detects_something(self):
         """Guard against the check above silently matching nothing."""

@@ -1,16 +1,18 @@
-"""Hard read only mode (fork hardening).
+"""Tool registration allowlist (fork hardening).
 
 Upstream gates writes with an opt in env var and a *denylist* of mutating
-tools. This fork inverts both:
+tools. This fork registers tools from an *allowlist* instead: a tool that
+upstream adds later is not registered unless it is reviewed and added here, so
+a new tool, mutating or not, cannot slip in through a merge.
 
-- Read only is always on. There is no env var to turn writes back on.
-- Registration is gated by an *allowlist*. A tool that upstream adds later is
-  not registered unless it is reviewed and added here, so a new mutating tool
-  cannot slip in through a merge.
+Writes are on, but every write must be approved by hand in the MCP client.
+Never "always allow" a tool in WRITE_TOOLS: a model can be talked into a write
+by a merchant name or memo it read back.
 
-Unregistered tools never appear in the tool list and cannot be called, so a
-model that was talked into a write by a merchant name or memo it read back has
-nothing to call.
+Some tools are never registered: monarch_login, monarch_login_with_token and
+monarch_logout replace or clear the stored session (log in with
+login_setup.py instead), and refresh_accounts posts refresh requests to the
+linked institutions.
 """
 
 import logging
@@ -20,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Every tool here has been checked to issue only GraphQL queries (or no network
 # call at all). Re-audit before adding anything.
-ALLOWED_TOOLS: FrozenSet[str] = frozenset(
+READ_TOOLS: FrozenSet[str] = frozenset(
     {
         # Session status (local only, no credential values returned)
         "check_auth_status",
@@ -63,12 +65,48 @@ ALLOWED_TOOLS: FrozenSet[str] = frozenset(
     }
 )
 
+# Tools that change Monarch data. Each call needs manual approval in the client.
+WRITE_TOOLS: FrozenSet[str] = frozenset(
+    {
+        # Accounts
+        "update_account",
+        # Transactions
+        "create_transaction",
+        "update_transaction",
+        "delete_transaction",
+        "categorize_transaction",
+        "update_transaction_notes",
+        "mark_transaction_reviewed",
+        "bulk_categorize_transactions",
+        "bulk_update_transactions",
+        "split_transaction",
+        "set_business_entity",
+        "upload_account_balance_history",
+        # Tags
+        "set_transaction_tags",
+        "add_transaction_tag",
+        "create_transaction_tag",
+        # Rules
+        "create_transaction_rule",
+        "update_transaction_rule",
+        "delete_transaction_rule",
+        "reorder_transaction_rule",
+        # Categories and budgets
+        "create_transaction_category",
+        "update_category",
+        "set_budget_amount",
+        # Goals
+        "update_savings_goal",
+        "set_goal_contribution",
+        # Merchants
+        "update_merchant",
+        "review_recurring_stream",
+    }
+)
+
+ALLOWED_TOOLS: FrozenSet[str] = READ_TOOLS | WRITE_TOOLS
+
 F = TypeVar("F", bound=Callable[..., Any])
-
-
-def is_read_only() -> bool:
-    """Always True in this fork."""
-    return True
 
 
 def install(mcp: Any) -> None:
@@ -84,7 +122,7 @@ def install(mcp: Any) -> None:
             positional = args[0] if args and isinstance(args[0], str) else None
             name = positional or kwargs.get("name") or getattr(fn, "__name__", "")
             if name not in ALLOWED_TOOLS:
-                logger.info("Read only fork: not registering %s", name)
+                logger.info("Not in the fork allowlist, not registering %s", name)
                 return fn
             return register(fn)
 
@@ -92,6 +130,7 @@ def install(mcp: Any) -> None:
 
     mcp.tool = guarded_tool  # type: ignore[method-assign]
     logger.warning(
-        "Read only fork: only %d allowlisted tools will be registered",
+        "Fork allowlist: only %d tools will be registered (%d of them write)",
         len(ALLOWED_TOOLS),
+        len(WRITE_TOOLS),
     )
